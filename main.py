@@ -3,25 +3,26 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-import json
+from pymongo import MongoClient
 import random
 import datetime
 import io
 import traceback
+import json
 
 # --- 1. SETUP & CONFIG ---
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
+MONGODB_URL = os.getenv('MONGODB_URL')
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-DATA_FILE = 'market_data.json'
+# MongoDB setup
+client = MongoClient(MONGODB_URL)
+db = client["kupid_bot"]
+collection = db["data"]
 
 def load_data():
-    if not os.path.exists(DATA_FILE):
+    doc = collection.find_one({"_id": "main"})
+    if not doc:
         return {
             "users": {},
             "kupidtv_usernames": {},
@@ -34,8 +35,8 @@ def load_data():
                 "bet_log_channel_id": None
             }
         }
-    with open(DATA_FILE, 'r') as f:
-        data = json.load(f)
+    doc.pop("_id", None)
+    data = doc
     data.setdefault("kupidtv_usernames", {})
     cfg = data.setdefault("config", {})
     cfg.setdefault("announcement_channel_id", None)
@@ -45,8 +46,7 @@ def load_data():
     return data
 
 def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+    collection.replace_one({"_id": "main"}, {"_id": "main", **data}, upsert=True)
 
 def is_command_allowed(interaction: discord.Interaction, cmd_name: str) -> tuple[bool, str]:
     data = load_data()
@@ -113,6 +113,11 @@ def build_market_embed(market: dict, m_id: str, status: str = "OPEN") -> discord
         embed.add_field(name="Winner", value=f"**{winner_key}. {winner_label}**", inline=False)
 
     return embed
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
@@ -254,7 +259,6 @@ async def leaderboard(interaction: discord.Interaction):
 async def create_market(interaction: discord.Interaction, question: str, opt_a: str, opt_b: str):
     data = load_data()
 
-    # FIX 1: Check for collisions before using the market ID
     m_id = str(random.randint(100, 999))
     while m_id in data["active_markets"]:
         m_id = str(random.randint(100, 999))
@@ -477,7 +481,6 @@ async def resolve(interaction: discord.Interaction, market_id: str, winner: str)
     total_pot = sum(b["amount"] for b in market["bets"])
     win_pool = market["options"][winner]["pool"]
 
-    # FIX 3: Calculate loser_label once, cleanly, before the loops
     loser_key = next(k for k in market["options"] if k != winner)
     loser_label = market["options"][loser_key]["label"]
 
@@ -619,8 +622,10 @@ async def configure_role(interaction: discord.Interaction, cmd: str, role: disco
 @bot.tree.command(name="export_json", description="[Admin] Download a raw JSON backup of all data")
 @app_commands.checks.has_permissions(administrator=True)
 async def export_json(interaction: discord.Interaction):
-    with open(DATA_FILE, 'rb') as f:
-        await interaction.response.send_message("📂 **JSON Backup:**", file=discord.File(f, DATA_FILE), ephemeral=True)
+    data = load_data()
+    json_bytes = json.dumps(data, indent=4).encode('utf-8')
+    with io.BytesIO(json_bytes) as f:
+        await interaction.response.send_message("📂 **JSON Backup:**", file=discord.File(f, "market_data.json"), ephemeral=True)
 
 @bot.tree.command(name="export_txt", description="[Admin] Download a TXT ledger (KupidTv username - coins)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -648,7 +653,6 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     uid = str(member.id)
     data["users"][uid] = data["users"].get(uid, 1000) + amount
     save_data(data)
-    # FIX 4: Made ephemeral so the whole server doesn't see admin actions
     await interaction.response.send_message(f"✅ Added **{amount} $KUPID** to {member.mention}.", ephemeral=True)
 
 @bot.tree.command(name="take", description="[Admin] Remove $KUPID from a user's balance")
@@ -659,7 +663,6 @@ async def take(interaction: discord.Interaction, member: discord.Member, amount:
     uid = str(member.id)
     data["users"][uid] = max(0, data["users"].get(uid, 1000) - amount)
     save_data(data)
-    # FIX 4: Made ephemeral so the whole server doesn't see admin actions
     await interaction.response.send_message(f"🚨 Deducted **{amount} $KUPID** from {member.mention}.", ephemeral=True)
 
 # --- 6. ERROR HANDLING ---
